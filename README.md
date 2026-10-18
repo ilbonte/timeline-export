@@ -93,6 +93,10 @@ The response carries `GellerElement`s whose payloads unwrap
 the `semantic_segment` column of those rows is the protobuf the decoder reads.
 `content-type` must be exactly `application/grpc` — `application/grpc+proto` returns 404.
 
+Downloads can span multiple responses. The client follows each continuation in
+`SyncResult` field 4 by sending it in `SyncItem` field 3, and writes the database only
+after all pages succeed. This is separate from the incremental sync token in field 8.
+
 **The key** lives in the `on_device_location_history` security domain. `web_key.py` gets it
 with a browser: it drives the same `accounts.google.com/encryption/unlock/android` page
 Play services uses, standing in a `window.mm` shim where Android has its WebView JS
