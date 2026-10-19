@@ -81,10 +81,11 @@ def one(msg, f):
 # ---------- request ----------
 ODLH = 79   # GellerDataType.ENCRYPTED_ONDEVICE_LOCATION_HISTORY
 
-def build_request(sync_token=None, client_id="SEMANTICLOCATION"):
-    # SyncItem{ dataType=1, syncToken=2 }
+def build_request(sync_token=None, client_id="SEMANTICLOCATION", continuation=None):
+    # SyncItem{ dataType=1, syncToken=2, corpusName=3 }
     item = fld_varint(1, ODLH)
     if sync_token: item += fld_str(2, sync_token)
+    if continuation: item += fld_bytes(3, continuation)
     # BatchSyncRequest{ items=1, clientId=2 }
     return fld_bytes(1, item) + fld_str(2, client_id)
 
@@ -94,8 +95,10 @@ def grpc_unframe(buf, encoding='gzip'):
     """gRPC length-prefixed frames: 1 flag byte (1 = compressed) + 4-byte BE length."""
     import gzip, zlib
     out, i = [], 0
-    while i + 5 <= len(buf):
+    while i < len(buf):
+        if i + 5 > len(buf): raise RuntimeError('truncated gRPC frame header')
         comp = buf[i]; ln = struct.unpack('>I', buf[i+1:i+5])[0]; i += 5
+        if i + ln > len(buf): raise RuntimeError('truncated gRPC frame payload')
         payload = buf[i:i+ln]; i += ln
         if comp:
             if 'gzip' in (encoding or ''):
@@ -161,6 +164,40 @@ def sync_token_of(resp_msg):
         if isinstance(tok, bytes): return tok.decode('utf8', 'replace')
     return None
 
+def fetch_pages(client, token, sync_token=None, debug=False):
+    continuation, seen = None, set()
+    while True:
+        r = client.post("https://geller-pa.googleapis.com/geller.oneplatform.GellerService/BatchSync",
+                        content=grpc_frame(build_request(sync_token, continuation=continuation)),
+                        headers={"content-type": "application/grpc",
+                                 "authorization": f"Bearer {token}",
+                                 "grpc-accept-encoding": "identity,gzip", "te": "trailers"})
+        if debug:
+            print(f"  HTTP {r.status_code} {r.http_version}  ct={r.headers.get('content-type')!r} "
+                  f"grpc-status={r.headers.get('grpc-status')!r} grpc-encoding={r.headers.get('grpc-encoding')!r} "
+                  f"len={len(r.content)}", file=sys.stderr)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code} from Google")
+        status = r.headers.get("grpc-status", "0")
+        if status != "0":
+            raise RuntimeError(f"gRPC error {status}: {r.headers.get('grpc-message', '(no message)')}")
+        frames = grpc_unframe(r.content, r.headers.get('grpc-encoding', 'gzip'))
+        if not frames: raise RuntimeError('empty gRPC response')
+        continuation = None
+        for frame in frames:
+            for _, item_b in parse(frame).get(1, []):
+                item = parse(item_b)
+                if one(item, 1): raise RuntimeError('server returned an error result')
+                sr_b = one(item, 2)
+                # Play services echoes SyncResult field 4 into SyncItem field 3 to fetch the next page.
+                if sr_b: continuation = one(parse(sr_b), 4) or continuation
+        if continuation:
+            if continuation in seen: raise RuntimeError('repeated backup continuation; download incomplete')
+            seen.add(continuation)
+        sync_token = None
+        yield r
+        if not continuation: return
+
 def rows_of(snap):
     cols = [(c[1]).decode('utf8', 'replace') for c in snap.get(4, [])]
     for _, row_b in snap.get(5, []):
@@ -186,7 +223,7 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS semantic_segment_table(
  segment_type INTEGER NOT NULL, hierarchy_level INTEGER, fprint INTEGER);"""
 
 def write_db(path, records):
-    # Always build a FRESH db: a BatchSync response is a complete snapshot of the corpus,
+    # Always build a FRESH db after collecting every page of the corpus:
     # and appending into a container-copied file fails anyway (its real schema declares
     # obfuscated_gaia_id NOT NULL with no default). Write to .tmp, then replace atomically.
     tmp = path + ".tmp"
@@ -222,7 +259,7 @@ def main():
     ap.add_argument("--key");   ap.add_argument("--key-file")
     ap.add_argument("--sync-token", help="resume token from a previous run (incremental)")
     ap.add_argument("-o", "--out", default="out/odlh-storage.db")
-    ap.add_argument("--raw", help="also dump the raw BatchSyncResponse here (debugging)")
+    ap.add_argument("--raw", help="also dump raw response frames from all pages here (debugging)")
     ap.add_argument("--debug", action="store_true", help="print HTTP status/version/headers")
     a = ap.parse_args()
 
@@ -235,39 +272,26 @@ def main():
     except ImportError:
         sys.exit("error: pip install 'httpx[http2]' cryptography")
 
-    body = grpc_frame(build_request(a.sync_token))
+    recs, snaps, raw_pages = [], 0, []
     with httpx.Client(http2=True, timeout=60) as c:
-        r = c.post("https://geller-pa.googleapis.com/geller.oneplatform.GellerService/BatchSync",
-                   content=body,
-                   headers={"content-type": "application/grpc",
-                            "authorization": f"Bearer {token}",
-                            "grpc-accept-encoding": "identity,gzip",
-                            "te": "trailers"})
-    if a.debug:
-        print(f"  HTTP {r.status_code} {r.http_version}  ct={r.headers.get('content-type')!r} "
-              f"grpc-status={r.headers.get('grpc-status')!r} grpc-encoding={r.headers.get('grpc-encoding')!r} "
-              f"len={len(r.content)}", file=sys.stderr)
-    if r.status_code != 200:
-        body = r.content[:200].decode('utf8', 'replace').replace('\n', ' ')
-        sys.exit(f"HTTP {r.status_code} from {r.url} — not a gRPC response.\n  body: {body}")
-    status = r.headers.get("grpc-status", "0")
-    if status != "0":
-        sys.exit(f"gRPC error {status}: {r.headers.get('grpc-message','(no message)')}")
+        try:
+            for page, r in enumerate(fetch_pages(c, token, a.sync_token, a.debug), 1):
+                if a.raw: raw_pages.append(r.content)
+                for frame in grpc_unframe(r.content, r.headers.get('grpc-encoding', 'gzip')):
+                    for snap in snapshots(parse(frame), key):
+                        snaps += 1
+                        table = (one(snap, 1) or b'').decode('utf8', 'replace')
+                        dbid = one(snap, 6)
+                        if table != 'semantic_segment_table': continue
+                        for row in rows_of(snap):
+                            if row.get('semantic_segment'):
+                                row.setdefault('database_id', dbid)
+                                recs.append(row)
+                print(f"  page {page}: {len(recs)} segments collected", file=sys.stderr)
+        except RuntimeError as e:
+            sys.exit(f'error: {e}')
     if a.raw:
-        with open(a.raw, "wb") as f: f.write(r.content)
-
-    recs, snaps = [], 0
-    frames = grpc_unframe(r.content, r.headers.get('grpc-encoding', 'gzip'))
-    if not frames: sys.exit('empty gRPC response')
-    for snap in snapshots(parse(frames[0]), key):
-        snaps += 1
-        table = (one(snap, 1) or b'').decode('utf8', 'replace')
-        dbid = one(snap, 6)
-        if table != 'semantic_segment_table': continue
-        for row in rows_of(snap):
-            if row.get('semantic_segment'):
-                row.setdefault('database_id', dbid)
-                recs.append(row)
+        with open(a.raw, "wb") as f: f.write(b''.join(raw_pages))
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     n = write_db(a.out, recs)
     print(f"wrote {a.out}: {n} segments from {snaps} snapshot(s)", file=sys.stderr)
